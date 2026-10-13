@@ -205,15 +205,16 @@ static int __maybe_unused st_accel_suspend(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct iio_dev *indio_dev;
-	int ret;
 	struct st_sensor_data *sdata;
 
 	indio_dev = i2c_get_clientdata(client);
 	sdata = iio_priv(indio_dev);
-	pr_info("%s", __func__);
+	dev_dbg(dev, "%s: buffer %s\n", __func__,
+		iio_buffer_enabled(indio_dev) ? "enabled" : "disabled");
 	st_sensors_set_enable(indio_dev, false);
 	st_sensors_set_dataready_irq(indio_dev, false);
-	disable_irq(sdata->irq);
+	if (sdata->irq > 0)
+		disable_irq(sdata->irq);
 
 	return 0;
 }
@@ -223,18 +224,26 @@ static int __maybe_unused st_accel_resume(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct iio_dev *indio_dev;
 	struct st_sensor_data *sdata;
-	int ret;
 
 	indio_dev = i2c_get_clientdata(client);
 	sdata = iio_priv(indio_dev);
 
-	pr_info("%s", __func__);
-	st_sensors_set_enable(indio_dev, true);
-	st_sensors_set_dataready_irq(indio_dev, true);
-	// enabling the irq here will reduce the number of spurious irqs, and the
-	// device will keep on working after resume.
-	// Still not enough...
-	enable_irq(sdata->irq);
+	dev_dbg(dev, "%s: buffer %s\n", __func__,
+		iio_buffer_enabled(indio_dev) ? "enabled" : "disabled");
+	/*
+	 * Only bring the sensor and its data-ready interrupt back if a buffer
+	 * was running. Otherwise the sensor is normally powered down and
+	 * sampled on demand via read_raw. Unconditionally enabling DRDY here
+	 * left the level-low line asserted with no buffer to drain it, so
+	 * st_sensors_irq_thread() returned IRQ_NONE ~100k times until the core
+	 * disabled the interrupt ("irq NN: nobody cared"), hogging CPU0.
+	 */
+	if (iio_buffer_enabled(indio_dev)) {
+		st_sensors_set_enable(indio_dev, true);
+		st_sensors_set_dataready_irq(indio_dev, true);
+	}
+	if (sdata->irq > 0)
+		enable_irq(sdata->irq);
 	return 0;
 }
 

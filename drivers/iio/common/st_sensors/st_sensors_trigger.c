@@ -87,8 +87,8 @@ static irqreturn_t st_sensors_irq_thread(int irq, void *p)
 	    st_sensors_new_samples_available(indio_dev, sdata)) {
 		iio_trigger_poll_nested(p);
 	} else {
-		pr_info(
-			"st_sensors_irq_thread: %i returning IRQ_NONE (%i/%i/%i/%u) %s",
+		pr_debug_ratelimited(
+			"st_sensors_irq_thread: %i returning IRQ_NONE (%i/%i/%i/%u) %s\n",
 			irq,
 		   	sdata->hw_irq_trigger,
 			st_sensors_new_samples_available(indio_dev, sdata),
