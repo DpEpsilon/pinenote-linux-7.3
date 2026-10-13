@@ -1295,7 +1295,17 @@ static void rockchip_ebc_refresh(struct rockchip_ebc *ebc,
 	// Resume synchronously before writing to any registers
 	ret = pm_runtime_resume_and_get(dev);
 	if (ret < 0) {
-		drm_err(drm, "Failed to resume: %d\n", ret);
+		drm_err_ratelimited(drm, "Failed to resume: %d\n", ret);
+		/*
+		 * A failing ->runtime_resume() leaves power.runtime_error set,
+		 * after which the PM core refuses every later resume with
+		 * -EINVAL until the status is reset. The usual cause is a
+		 * transient supply problem (e.g. vdrive not reaching power
+		 * good), so clear the error and let the next refresh retry
+		 * instead of leaving the display dead until reboot.
+		 */
+		if (pm_runtime_status_suspended(dev))
+			pm_runtime_set_suspended(dev);
 		return;
 	}
 	pr_debug("%s pm_runtime_resume_and_get took %lld ms", __func__, ktime_ms_delta(ktime_get(), time_start_resume));
@@ -2111,10 +2121,15 @@ static int __maybe_unused rockchip_ebc_suspend(struct device *dev)
 static int __maybe_unused rockchip_ebc_resume(struct device *dev)
 {
 	struct rockchip_ebc *ebc = dev_get_drvdata(dev);
+	int ret;
 
 	pr_info("%s %lld", __func__, ktime_get());
 
-	pm_runtime_force_resume(dev);
+	ret = pm_runtime_force_resume(dev);
+	dev_dbg(dev, "%s: force_resume=%d rpm_status=%s\n", __func__, ret,
+		pm_runtime_status_suspended(dev) ? "suspended" : "active");
+	if (ret)
+		dev_err(dev, "runtime resume failed: %d\n", ret);
 
 	return drm_mode_config_helper_resume(&ebc->drm);
 }
@@ -2135,11 +2150,16 @@ static int rockchip_ebc_runtime_suspend(struct device *dev)
 static int rockchip_ebc_runtime_resume(struct device *dev)
 {
 	struct rockchip_ebc *ebc = dev_get_drvdata(dev);
+	ktime_t start = ktime_get();
 	int ret;
 
 	ret = regulator_bulk_enable(EBC_NUM_SUPPLIES, ebc->supplies);
-	if (ret)
+	dev_dbg(dev, "%s: supplies enabled: %d after %lld ms\n", __func__, ret,
+		ktime_ms_delta(ktime_get(), start));
+	if (ret) {
+		dev_err(dev, "failed to enable supplies: %d\n", ret);
 		return ret;
+	}
 
 	ret = clk_prepare_enable(ebc->hclk);
 	if (ret)
@@ -2405,6 +2425,11 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "Failed to request IRQ\n");
 
+	/*
+	 * power.runtime_error survives unbind/rebind; reset it so a rebind
+	 * can recover from a failed runtime resume in the previous binding.
+	 */
+	pm_runtime_set_suspended(dev);
 	pm_runtime_set_autosuspend_delay(dev, EBC_SUSPEND_DELAY_MS);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_enable(dev);
@@ -2416,7 +2441,7 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 
 	ret = rockchip_ebc_waveform_init(ebc);
 	if (ret)
-		return ret;
+		goto err_disable_pm;
 
 	// Make sure ebc->lut_custom_active is initialised
 	rockchip_ebc_change_lut(ebc);
@@ -2438,7 +2463,7 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 	if (IS_ERR(ebc->refresh_thread)) {
 		ret = dev_err_probe(dev, PTR_ERR(ebc->refresh_thread),
 				    "Failed to start refresh thread\n");
-		goto err_disable_pm;
+		goto err_stop_temp_thread;
 	}
 
 	kthread_park(ebc->refresh_thread);
@@ -2446,10 +2471,14 @@ static int rockchip_ebc_probe(struct platform_device *pdev)
 
 	ret = rockchip_ebc_drm_init(ebc);
 	if (ret)
-		return ret;
+		goto err_stop_refresh_thread;
 
 	return 0;
 
+err_stop_refresh_thread:
+	kthread_stop(ebc->refresh_thread);
+err_stop_temp_thread:
+	kthread_stop(ebc->temp_upd_thread);
 err_disable_pm:
 	pm_runtime_disable(dev);
 	if (!pm_runtime_status_suspended(dev))
