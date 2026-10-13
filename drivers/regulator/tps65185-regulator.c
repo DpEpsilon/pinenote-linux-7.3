@@ -429,13 +429,14 @@ static irqreturn_t tps65185_irq_handler(int irq, void *p)
 		status1, ret1, status2, ret2);
 
 	/*
-	 * nINT is open drain and pulled up to the V3P3 switch output. If V3P3
-	 * is off, or the chip is not answering, the level-low line stays
-	 * asserted with nothing pending. Report IRQ_NONE so the spurious IRQ
-	 * detector can step in instead of letting this thread spin forever.
+	 * Keep the original semantics of always claiming the interrupt. With
+	 * V3P3 kept on and the IRQ masked across system sleep the stuck-line
+	 * case no longer occurs, and this handler also completes the EOC
+	 * (temperature conversion) used by the EBC on every refresh cycle, so
+	 * don't change behaviour on that path.
 	 */
-	if ((ret1 && ret2) || (!status1 && !status2))
-		return IRQ_NONE;
+	if (!status1 && !status2)
+		dev_dbg_ratelimited(dev, "irq with no status bits set\n");
 
 	if (!ret1 && (status1 & TPS65185_INT1_DTX))
 		iio_push_event(indio_dev,
