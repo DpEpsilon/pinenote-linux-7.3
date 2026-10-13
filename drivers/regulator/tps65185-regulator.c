@@ -110,6 +110,14 @@ struct tps65185 {
 	u32			total_down_delay_us;
 	u8			int_en1;
 	u8			int_en2;
+	int			irq;
+	/* Register state saved across system sleep (SLEEP mode loses it). */
+	unsigned int		saved_enable;
+	unsigned int		saved_vadj;
+	unsigned int		saved_vcom1;
+	unsigned int		saved_vcom2;
+	unsigned int		saved_tmst1;
+	bool			regs_saved;
 };
 
 static const struct regulator_ops tps65185_v3p3_ops = {
@@ -410,48 +418,64 @@ static irqreturn_t tps65185_irq_handler(int irq, void *p)
 {
 	struct iio_dev *indio_dev = p;
 	struct tps65185 *tps = iio_device_get_drvdata(indio_dev);
-	unsigned int status1, status2;
-	int ret;
+	struct device *dev = indio_dev->dev.parent;
+	unsigned int status1 = 0, status2 = 0;
+	int ret1, ret2;
 
-	ret = regmap_read(tps->regmap, TPS65185_REG_INT1, &status1);
-	if (!ret && (status1 & TPS65185_INT1_DTX))
+	ret1 = regmap_read(tps->regmap, TPS65185_REG_INT1, &status1);
+	ret2 = regmap_read(tps->regmap, TPS65185_REG_INT2, &status2);
+
+	dev_dbg(dev, "irq: INT1=%#04x (%d) INT2=%#04x (%d)\n",
+		status1, ret1, status2, ret2);
+
+	/*
+	 * nINT is open drain and pulled up to the V3P3 switch output. If V3P3
+	 * is off, or the chip is not answering, the level-low line stays
+	 * asserted with nothing pending. Report IRQ_NONE so the spurious IRQ
+	 * detector can step in instead of letting this thread spin forever.
+	 */
+	if ((ret1 && ret2) || (!status1 && !status2))
+		return IRQ_NONE;
+
+	if (!ret1 && (status1 & TPS65185_INT1_DTX))
 		iio_push_event(indio_dev,
 			       IIO_UNMOD_EVENT_CODE(IIO_TEMP, 0,
 						    IIO_EV_TYPE_THRESH_ADAPTIVE,
 						    IIO_EV_DIR_EITHER),
 			       iio_get_time_ns(indio_dev));
 
-	if (!ret && (status1 & TPS65185_INT1_TSD))
-		printk(KERN_ERR "tps65185 TSD Thermal shutdown interrupt detected");
-	if (!ret && (status1 & TPS65185_INT1_HOT))
-		printk(KERN_ERR "tps65185 HOT Thermal shutdown early warning interrupt detected");
-	if (!ret && (status1 & TPS65185_INT1_TMST_HOT))
-		printk(KERN_ERR "tps65185 TMST HOT Thermistor hot interrupt detected");
-	if (!ret && (status1 & TPS65185_INT1_TMST_COLD))
-		printk(KERN_ERR "tps65185 TMST COLD Thermistor hot interrupt detected");
-	if (!ret && (status1 & TPS65185_INT1_UVLO))
-		printk(KERN_ERR "tps65185 UVLO VIN under voltage detect interrupt detected");
-	// ACQC INT
-	// PRGC Int
+	if (!ret1) {
+		if (status1 & TPS65185_INT1_TSD)
+			dev_err_ratelimited(dev, "thermal shutdown\n");
+		if (status1 & TPS65185_INT1_HOT)
+			dev_err_ratelimited(dev, "thermal shutdown early warning\n");
+		if (status1 & TPS65185_INT1_TMST_HOT)
+			dev_err_ratelimited(dev, "thermistor hot\n");
+		if (status1 & TPS65185_INT1_TMST_COLD)
+			dev_err_ratelimited(dev, "thermistor cold\n");
+		if (status1 & TPS65185_INT1_UVLO)
+			dev_err_ratelimited(dev, "VIN undervoltage lockout\n");
+		/* ACQC and PRGC (VCOM calibration/programming) are not used. */
+	}
 
-	ret = regmap_read(tps->regmap, TPS65185_REG_INT2, &status2);
-
-	if (!ret && (status2 & TPS65185_INT2_VB_UV))
-		printk(KERN_ERR "tps65185 Positive Boost Converter (VB) undervoltage detected");
-	if (!ret && (status2 & TPS65185_INT2_VDDH_UV))
-		printk(KERN_ERR "tps65185 VDDH undervoltage detected");
-	if (!ret && (status2 & TPS65185_INT2_VN_UV))
-		printk(KERN_ERR "tps65185 Inverting Boost Converter (VB) undervoltage detected");
-	if (!ret && (status2 & TPS65185_INT2_VPOS_UV))
-		printk(KERN_ERR "tps65185 VPOS undervoltage detected");
-	if (!ret && (status2 & TPS65185_INT2_VEE_UV))
-		printk(KERN_ERR "tps65185 VEE undervoltage detected");
-	if (!ret && (status2 & TPS65185_INT2_VCOMF))
-		printk(KERN_ERR "tps65185 VCOM fault detection");
-	if (!ret && (status2 & TPS65185_INT2_VNEG_UV))
-		printk(KERN_ERR "tps65185 VNEG undervoltage detected");
-	if (!ret && (status2 & TPS65185_INT2_EOC))
-		complete(&tps->temp_completion);
+	if (!ret2) {
+		if (status2 & TPS65185_INT2_VB_UV)
+			dev_err_ratelimited(dev, "VB (positive boost) undervoltage\n");
+		if (status2 & TPS65185_INT2_VDDH_UV)
+			dev_err_ratelimited(dev, "VDDH undervoltage\n");
+		if (status2 & TPS65185_INT2_VN_UV)
+			dev_err_ratelimited(dev, "VN (inverting boost) undervoltage\n");
+		if (status2 & TPS65185_INT2_VPOS_UV)
+			dev_err_ratelimited(dev, "VPOS undervoltage\n");
+		if (status2 & TPS65185_INT2_VEE_UV)
+			dev_err_ratelimited(dev, "VEE undervoltage\n");
+		if (status2 & TPS65185_INT2_VCOMF)
+			dev_err_ratelimited(dev, "VCOM fault\n");
+		if (status2 & TPS65185_INT2_VNEG_UV)
+			dev_err_ratelimited(dev, "VNEG undervoltage\n");
+		if (status2 & TPS65185_INT2_EOC)
+			complete(&tps->temp_completion);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -685,6 +709,7 @@ static int tps65185_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
+	tps->irq = client->irq;
 	ret = devm_request_threaded_irq(dev, client->irq, NULL,
 					tps65185_irq_handler, IRQF_ONESHOT,
 					dev_name(dev), indio_dev);
@@ -694,69 +719,184 @@ static int tps65185_probe(struct i2c_client *client)
 	return 0;
 }
 
-static int __maybe_unused tps65185_suspend(struct device *dev)
+/*
+ * System sleep
+ *
+ * On the PineNote the TPS65185 nINT line is pulled up to the output of the
+ * V3P3 switch (VCC_EINK1, see the v3p3 node in the DT), so whenever V3P3 is
+ * off the level-low interrupt reads as asserted. PWR_GOOD is very likely
+ * pulled up the same way.
+ *
+ * The old suspend callback wrote ENABLE = STANDBY, which also cleared V3P3_EN,
+ * and resume never set it again. V3P3 then stayed off after resume while the
+ * regulator core still counted it as enabled (it is always-on), the interrupt
+ * stormed, and enabling vdrive for the next display refresh failed.
+ *
+ * In deep sleep the RK817 switches off vin3p3 (vcc_3v3) and, most likely, the
+ * I/O domain driving WAKEUP, so the chip loses its register state no matter
+ * what we do here. Make that explicit and deterministic: mask the interrupt, save
+ * the volatile settings, drop WAKEUP to enter SLEEP, and on resume wake the
+ * chip and reprogram everything before unmasking the interrupt. This also
+ * makes pm_test=devices exercise the same reinit path as a real suspend.
+ */
+static int tps65185_save_regs(struct tps65185 *tps)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct tps65185 *tps;
 	int ret;
 
-	tps = i2c_get_clientdata(client);
-	// set STANDBY of ENABLE reg to 1
-	// pull PWRUP pin low (falling edge)
-	// -> will go into either STANDBY or SLEEP, depending on WAKEUP pin
-	// we want STANDBY, so WAKUP=1
-	gpiod_set_value(tps->wakeup_gpio, 1);
+	ret = regmap_read(tps->regmap, TPS65185_REG_ENABLE, &tps->saved_enable);
+	if (!ret)
+		ret = regmap_read(tps->regmap, TPS65185_REG_VADJ, &tps->saved_vadj);
+	if (!ret)
+		ret = regmap_read(tps->regmap, TPS65185_REG_VCOM1, &tps->saved_vcom1);
+	if (!ret)
+		ret = regmap_read(tps->regmap, TPS65185_REG_VCOM2, &tps->saved_vcom2);
+	if (!ret)
+		ret = regmap_read(tps->regmap, TPS65185_REG_TMST1, &tps->saved_tmst1);
 
-	// initiate standby
-	ret = regmap_write(tps->regmap, TPS65185_REG_ENABLE,
-			TPS65185_ENABLE_STANDBY);
+	return ret;
+}
+
+static int tps65185_restore_regs(struct device *dev, struct tps65185 *tps)
+{
+	unsigned int enable;
+	int ret;
+
+	ret = tps65185_set_config(dev, tps);
 	if (ret)
-		printk(KERN_ERR "tps65185 suspend: could not set standby bit");
+		return ret;
+
+	/* If saving failed, keep the EEPROM defaults loaded on wakeup. */
+	if (!tps->regs_saved)
+		goto restore_irq_enable;
+
+	ret = regmap_update_bits(tps->regmap, TPS65185_REG_VADJ,
+				 TPS65185_VADJ_VSET, tps->saved_vadj);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(tps->regmap, TPS65185_REG_VCOM1, tps->saved_vcom1);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(tps->regmap, TPS65185_REG_VCOM2,
+				 TPS65185_VCOM2_VCOM_MSB, tps->saved_vcom2);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(tps->regmap, TPS65185_REG_TMST1,
+				 TPS65185_TMST1_DT, tps->saved_tmst1);
+	if (ret)
+		return ret;
+
+restore_irq_enable:
+	/* INT_EN bits are 1 = enabled; restore whatever probe/IIO set up. */
+	ret = regmap_write(tps->regmap, TPS65185_REG_INT_EN1, tps->int_en1);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(tps->regmap, TPS65185_REG_INT_EN2, tps->int_en2);
+	if (ret)
+		return ret;
+
+	/*
+	 * Same as probe: rails in standby but armed for the POWERUP pin, plus
+	 * the V3P3 switch and VCOM enable exactly as they were before suspend.
+	 * V3P3 is always-on in the PineNote DT and must come back, otherwise
+	 * nINT/PWR_GOOD lose their pull-up.
+	 */
+	enable = TPS65185_ENABLE_STANDBY |
+		 TPS65185_ENABLE_VDDH_EN | TPS65185_ENABLE_VPOS_EN |
+		 TPS65185_ENABLE_VEE_EN | TPS65185_ENABLE_VNEG_EN;
+	enable |= tps->saved_enable &
+		  (TPS65185_ENABLE_V3P3_EN | TPS65185_ENABLE_VCOM_EN);
+
+	return regmap_write(tps->regmap, TPS65185_REG_ENABLE, enable);
+}
+
+/*
+ * POWERUP and VCOM_CTRL belong to the regulator core (ena_gpiod), which only
+ * ever sets their value. If the GPIO bank lost its state in deep sleep they
+ * come back as inputs and enabling vdrive/vcom would silently do nothing, so
+ * put them back to driven-low (both regulators are off at this point).
+ */
+static void tps65185_restore_gpio_dir(struct device *dev,
+				      struct gpio_desc *gpio, const char *name)
+{
+	/* gpiod_get_direction(): 1 = input, 0 = output, < 0 = error */
+	if (!gpio || gpiod_get_direction(gpio) != 1)
+		return;
+
+	dev_warn(dev, "%s GPIO lost its direction in suspend, restoring\n", name);
+	gpiod_direction_output(gpio, 0);
+}
+
+static int __maybe_unused tps65185_suspend(struct device *dev)
+{
+	struct tps65185 *tps = dev_get_drvdata(dev);
+	int ret;
+
+	if (tps->irq > 0)
+		disable_irq(tps->irq);
+
+	ret = tps65185_save_regs(tps);
+	tps->regs_saved = !ret;
+	if (ret) {
+		dev_warn(dev, "failed to save registers: %d\n", ret);
+		/* v3p3 is always-on; make sure resume turns it back on. */
+		tps->saved_enable = TPS65185_ENABLE_V3P3_EN;
+	}
+
+	dev_dbg(dev,
+		"suspend: ENABLE=%#04x VADJ=%#04x VCOM=%#04x/%#04x TMST1=%#04x PG=%d\n",
+		tps->saved_enable, tps->saved_vadj, tps->saved_vcom1,
+		tps->saved_vcom2, tps->saved_tmst1,
+		tps->pwr_good_gpio ?
+		gpiod_get_value_cansleep(tps->pwr_good_gpio) : -1);
+
+	/*
+	 * Rails should already be off: the EBC (our only consumer) runtime
+	 * suspends before us. If they are not, the chip runs its power-down
+	 * sequence before entering SLEEP.
+	 */
+	gpiod_set_value_cansleep(tps->wakeup_gpio, 0);
 
 	return 0;
 }
 
 static int __maybe_unused tps65185_resume(struct device *dev)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-
-	struct tps65185 *tps;
+	struct tps65185 *tps = dev_get_drvdata(dev);
+	unsigned int int1 = 0, int2 = 0, val = 0;
 	int ret;
 
-	tps = i2c_get_clientdata(client);
-
-	// todo: is the location correct here?
+	/*
+	 * The GPIO block may have been powered down with the logic domain;
+	 * set the direction again, not just the value.
+	 */
+	tps65185_restore_gpio_dir(dev, tps->powerup_gpio, "powerup");
+	tps65185_restore_gpio_dir(dev, tps->vcom_ctrl_gpio, "vcom_ctrl");
+	gpiod_direction_output(tps->wakeup_gpio, 1);
 	msleep(TPS65185_WAKEUP_DELAY_MS);
 
-	ret = tps65185_set_config(dev, tps);
+	ret = tps65185_restore_regs(dev, tps);
 	if (ret)
-		return dev_err_probe(dev, ret, "Failed to set config at resume\n");
+		dev_err(dev, "failed to restore registers at resume: %d\n", ret);
 
-	// disable all INT_EN1 interrupts
-	tps->int_en1 = 0xff;
-	ret = regmap_write(tps->regmap, TPS65185_REG_INT_EN1, tps->int_en1);
-	if (ret)
-		return ret;
+	/* Give V3P3 time to recharge the nINT pull-up, then drop stale events. */
+	usleep_range(1000, 2000);
+	regmap_read(tps->regmap, TPS65185_REG_INT1, &int1);
+	regmap_read(tps->regmap, TPS65185_REG_INT2, &int2);
+	regmap_read(tps->regmap, TPS65185_REG_ENABLE, &val);
 
-	// only enable temperature-is-ready irq
-	tps->int_en2 = 0xff;
-	ret = regmap_write(tps->regmap, TPS65185_REG_INT_EN2, tps->int_en2);
-	if (ret)
-		return ret;
+	dev_dbg(dev, "resume: ret=%d ENABLE=%#04x stale INT1=%#04x INT2=%#04x PG=%d\n",
+		ret, val, int1, int2,
+		tps->pwr_good_gpio ?
+		gpiod_get_value_cansleep(tps->pwr_good_gpio) : -1);
 
-	// If I understand correctly regulator TPS65185_REGULATOR_VDRIVE is tied to
-	// the powerup pin - therefore when the ebc resumes the tps65185 is
-	// directly activated. I think its correct to do nothing here and wait.
-	// Similar to the probe function which also puts the pmic into standby
-	/* Power down all rails, but enable control by the powerup GPIO. */
-	ret = regmap_write(tps->regmap, TPS65185_REG_ENABLE,
-			   TPS65185_ENABLE_STANDBY |
-			   TPS65185_ENABLE_VDDH_EN |
-			   TPS65185_ENABLE_VPOS_EN |
-			   TPS65185_ENABLE_VEE_EN |
-			   TPS65185_ENABLE_VNEG_EN);
+	if (tps->irq > 0)
+		enable_irq(tps->irq);
 
-	return 0;
+	return ret;
 }
 
 static SIMPLE_DEV_PM_OPS(tps65185_pm, tps65185_suspend, tps65185_resume);
