@@ -2118,6 +2118,45 @@ static int __maybe_unused rockchip_ebc_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * Undo rockchip_ebc_prepare(): restore the DRM state saved there.
+ *
+ * .prepare queues ROCKCHIP_EBC_WORK_ITEM_SUSPEND (draw the off screen) and then
+ * immediately disables the CRTC, which parks the refresh thread. An idle
+ * thread is woken only to park, so the work item usually stays pending and
+ * used to be executed by the first refresh *after* resume: the panel then
+ * showed the off/sleep screen instead of the restored content, and the
+ * content damage queued by the resume commit (plus the global refresh the
+ * thread queues after a suspend) was dropped by that branch. If nothing else
+ * redrew (e.g. the compositor was not committing), the panel stayed on the
+ * sleep screen. Drop the stale item and ask for a full redraw instead.
+ */
+static int rockchip_ebc_restore_display(struct rockchip_ebc *ebc)
+{
+	struct device *dev = ebc->drm.dev;
+	u32 stale;
+	int ret;
+
+	if (!ebc->drm_suspended)
+		return 0;
+
+	spin_lock(&ebc->work_item_lock);
+	stale = ebc->work_item;
+	ebc->work_item &= ~ROCKCHIP_EBC_WORK_ITEM_SUSPEND;
+	ebc->work_item |= ROCKCHIP_EBC_WORK_ITEM_GLOBAL_REFRESH;
+	spin_unlock(&ebc->work_item_lock);
+
+	dev_dbg(dev, "%s: work_item was %#x, suspend_was_requested=%d\n",
+		__func__, stale, ebc->suspend_was_requested);
+
+	ebc->drm_suspended = false;
+	ret = drm_mode_config_helper_resume(&ebc->drm);
+	if (ret)
+		dev_err(dev, "failed to restore DRM state: %d\n", ret);
+
+	return ret;
+}
+
 static int __maybe_unused rockchip_ebc_resume(struct device *dev)
 {
 	struct rockchip_ebc *ebc = dev_get_drvdata(dev);
@@ -2131,7 +2170,7 @@ static int __maybe_unused rockchip_ebc_resume(struct device *dev)
 	if (ret)
 		dev_err(dev, "runtime resume failed: %d\n", ret);
 
-	return drm_mode_config_helper_resume(&ebc->drm);
+	return rockchip_ebc_restore_display(ebc);
 }
 
 static int rockchip_ebc_runtime_suspend(struct device *dev)
@@ -2204,14 +2243,39 @@ static int rockchip_ebc_prepare(struct device *dev)
 	spin_unlock(&ebc->work_item_lock);
 
 	ret = drm_mode_config_helper_suspend(&ebc->drm);
-	if (ret)
+	if (ret) {
+		spin_lock(&ebc->work_item_lock);
+		ebc->work_item &= ~ROCKCHIP_EBC_WORK_ITEM_SUSPEND;
+		spin_unlock(&ebc->work_item_lock);
 		return ret;
+	}
+
+	ebc->drm_suspended = true;
+	dev_dbg(dev, "%s: DRM state saved, work_item=%#x\n", __func__,
+		ebc->work_item);
 
 	return 0;
 }
 
+/*
+ * If the transition is aborted after .prepare but before our .suspend ran
+ * (e.g. another device failed to suspend or a wakeup event arrived), the PM
+ * core calls .complete without .resume. Restore the display here in that
+ * case; after a normal resume this is a no-op.
+ */
+static void rockchip_ebc_complete(struct device *dev)
+{
+	struct rockchip_ebc *ebc = dev_get_drvdata(dev);
+
+	if (ebc->drm_suspended) {
+		dev_info(dev, "suspend aborted before .suspend, restoring display\n");
+		rockchip_ebc_restore_display(ebc);
+	}
+}
+
 static const struct dev_pm_ops rockchip_ebc_dev_pm_ops = {
 	.prepare = rockchip_ebc_prepare,
+	.complete = rockchip_ebc_complete,
 	SET_SYSTEM_SLEEP_PM_OPS(rockchip_ebc_suspend, rockchip_ebc_resume)
 	SET_RUNTIME_PM_OPS(rockchip_ebc_runtime_suspend,
 			   rockchip_ebc_runtime_resume, NULL)

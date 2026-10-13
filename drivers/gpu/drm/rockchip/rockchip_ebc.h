@@ -127,6 +127,8 @@ struct rockchip_ebc {
 	// used to detect when we are suspending so we can do different things to
 	// the ebc display depending on whether we are sleeping or suspending
 	int				suspend_was_requested;
+	// DRM state was saved by .prepare and not yet restored
+	bool				drm_suspended;
 	// Cached temperature in deg C
 	int				temperature;
 	struct drm_rockchip_ebc_phase_sequence	*phase_sequence;
