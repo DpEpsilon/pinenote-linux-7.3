@@ -224,12 +224,23 @@ static int __maybe_unused st_accel_resume(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct iio_dev *indio_dev;
 	struct st_sensor_data *sdata;
+	int ret;
 
 	indio_dev = i2c_get_clientdata(client);
 	sdata = iio_priv(indio_dev);
 
 	dev_dbg(dev, "%s: buffer %s\n", __func__,
 		iio_buffer_enabled(indio_dev) ? "enabled" : "disabled");
+	/*
+	 * vdd/vddio (vcc_3v3) are switched off in deep sleep, so the sensor
+	 * comes back with power-on defaults. Most importantly its INT pin is
+	 * active high again and idles low, which a level-low IRQ sees as
+	 * permanently asserted. Reprogram everything before unmasking.
+	 */
+	ret = st_sensors_restore_config(indio_dev);
+	if (ret)
+		dev_err(dev, "failed to restore sensor config: %d\n", ret);
+
 	/*
 	 * Only bring the sensor and its data-ready interrupt back if a buffer
 	 * was running. Otherwise the sensor is normally powered down and

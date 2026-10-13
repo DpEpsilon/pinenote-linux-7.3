@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/iio/iio.h>
+#include <linux/irq.h>
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
@@ -418,6 +419,102 @@ int st_sensors_init_sensor(struct iio_dev *indio_dev,
 	return err;
 }
 EXPORT_SYMBOL_NS(st_sensors_init_sensor, "IIO_ST_SENSORS");
+
+/**
+ * st_sensors_restore_config() - reprogram the sensor after a power cycle
+ * @indio_dev: IIO device
+ *
+ * When the sensor supply is switched off during system suspend all its
+ * registers return to their power-on defaults. Besides losing full scale,
+ * BDU and DAS, that resets the interrupt polarity: the probe-time setting
+ * of the "active low" (IHL) bit is gone, so an active-low IRQ line idles
+ * low and a level-low interrupt fires continuously. Re-apply the settings
+ * done at probe time (st_sensors_init_sensor() and
+ * st_sensors_allocate_trigger()), leaving the sensor powered down with
+ * DRDY disabled. Safe to call when power was not lost.
+ */
+int st_sensors_restore_config(struct iio_dev *indio_dev)
+{
+	struct st_sensor_data *sdata = iio_priv(indio_dev);
+	const struct st_sensor_settings *settings = sdata->sensor_settings;
+	struct device *parent = indio_dev->dev.parent;
+	unsigned int irq_trig;
+	int err;
+
+	if (settings->drdy_irq.addr_ihl) {
+		unsigned int val = 0;
+
+		regmap_read(sdata->regmap, settings->drdy_irq.addr_ihl, &val);
+		dev_dbg(parent, "restore: reg %#04x (IHL) was %#04x\n",
+			settings->drdy_irq.addr_ihl, val);
+	}
+
+	err = st_sensors_set_enable(indio_dev, false);
+	if (err < 0)
+		return err;
+
+	err = st_sensors_set_dataready_irq(indio_dev, false);
+	if (err < 0)
+		return err;
+
+	if (sdata->current_fullscale) {
+		err = st_sensors_set_fullscale(indio_dev,
+					       sdata->current_fullscale->num);
+		if (err < 0)
+			return err;
+	}
+
+	err = st_sensors_set_odr(indio_dev, sdata->odr);
+	if (err < 0)
+		return err;
+
+	if (settings->bdu.addr) {
+		err = st_sensors_write_data_with_mask(indio_dev,
+						      settings->bdu.addr,
+						      settings->bdu.mask, true);
+		if (err < 0)
+			return err;
+	}
+
+	if (settings->das.addr) {
+		err = st_sensors_write_data_with_mask(indio_dev,
+						      settings->das.addr,
+						      settings->das.mask, 1);
+		if (err < 0)
+			return err;
+	}
+
+	if (sdata->int_pin_open_drain) {
+		u8 addr, mask;
+
+		if (sdata->drdy_int_pin == 1) {
+			addr = settings->drdy_irq.int1.addr_od;
+			mask = settings->drdy_irq.int1.mask_od;
+		} else {
+			addr = settings->drdy_irq.int2.addr_od;
+			mask = settings->drdy_irq.int2.mask_od;
+		}
+		err = st_sensors_write_data_with_mask(indio_dev, addr, mask, 1);
+		if (err < 0)
+			return err;
+	}
+
+	/* Same condition as st_sensors_allocate_trigger() */
+	if (sdata->irq > 0 && settings->drdy_irq.addr_ihl) {
+		irq_trig = irq_get_trigger_type(sdata->irq);
+		if (irq_trig == IRQF_TRIGGER_FALLING ||
+		    irq_trig == IRQF_TRIGGER_LOW) {
+			err = st_sensors_write_data_with_mask(indio_dev,
+					settings->drdy_irq.addr_ihl,
+					settings->drdy_irq.mask_ihl, 1);
+			if (err < 0)
+				return err;
+		}
+	}
+
+	return st_sensors_set_axis_enable(indio_dev, ST_SENSORS_ENABLE_ALL_AXIS);
+}
+EXPORT_SYMBOL_NS(st_sensors_restore_config, "IIO_ST_SENSORS");
 
 int st_sensors_set_dataready_irq(struct iio_dev *indio_dev, bool enable)
 {

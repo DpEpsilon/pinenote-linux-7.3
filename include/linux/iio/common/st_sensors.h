@@ -288,6 +288,8 @@ int st_sensors_init_sensor(struct iio_dev *indio_dev,
 
 int st_sensors_set_enable(struct iio_dev *indio_dev, bool enable);
 
+int st_sensors_restore_config(struct iio_dev *indio_dev);
+
 int st_sensors_set_axis_enable(struct iio_dev *indio_dev, u8 axis_enable);
 
 int st_sensors_power_enable(struct iio_dev *indio_dev);
