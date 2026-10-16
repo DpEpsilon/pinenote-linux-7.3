@@ -75,6 +75,8 @@ static irqreturn_t st_sensors_irq_thread(int irq, void *p)
 	struct iio_trigger *trig = p;
 	struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
 	struct st_sensor_data *sdata = iio_priv(indio_dev);
+	/* The same line also carries orientation changes, when that event is on */
+	bool orient = st_sensors_handle_orient_event(indio_dev);
 
 	/*
 	 * If this trigger is backed by a hardware interrupt and we have a
@@ -86,6 +88,8 @@ static irqreturn_t st_sensors_irq_thread(int irq, void *p)
 	if (sdata->hw_irq_trigger &&
 	    st_sensors_new_samples_available(indio_dev, sdata)) {
 		iio_trigger_poll_nested(p);
+	} else if (orient) {
+		return IRQ_HANDLED;
 	} else {
 		pr_debug_ratelimited(
 			"st_sensors_irq_thread: %i returning IRQ_NONE (%i/%i/%i/%u) %s\n",

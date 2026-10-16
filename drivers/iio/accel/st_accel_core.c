@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/acpi.h>
 #include <linux/iio/iio.h>
+#include <linux/iio/events.h>
 #include <linux/iio/sysfs.h>
 #include <linux/iio/trigger.h>
 
@@ -87,6 +88,41 @@ static const struct iio_chan_spec st_accel_12bit_channels[] = {
 			ST_ACCEL_DEFAULT_OUT_Z_L_ADDR,
 			st_accel_mount_matrix_ext_info),
 	IIO_CHAN_SOFT_TIMESTAMP(3)
+};
+
+/* Orientation changes (6D detection on Interrupt Generator 1) as an IIO event */
+static const struct iio_event_spec st_accel_orient_event = {
+	.type = IIO_EV_TYPE_CHANGE,
+	.dir = IIO_EV_DIR_NONE,
+	.mask_separate = BIT(IIO_EV_INFO_ENABLE),
+};
+
+static const struct iio_chan_spec st_accel_12bit_orient_channels[] = {
+	ST_SENSORS_LSM_CHANNELS_EXT(IIO_ACCEL,
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+			ST_SENSORS_SCAN_X, 1, IIO_MOD_X, 's', IIO_LE, 12, 16,
+			ST_ACCEL_DEFAULT_OUT_X_L_ADDR,
+			st_accel_mount_matrix_ext_info),
+	ST_SENSORS_LSM_CHANNELS_EXT(IIO_ACCEL,
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+			ST_SENSORS_SCAN_Y, 1, IIO_MOD_Y, 's', IIO_LE, 12, 16,
+			ST_ACCEL_DEFAULT_OUT_Y_L_ADDR,
+			st_accel_mount_matrix_ext_info),
+	ST_SENSORS_LSM_CHANNELS_EXT(IIO_ACCEL,
+			BIT(IIO_CHAN_INFO_RAW) | BIT(IIO_CHAN_INFO_SCALE),
+			ST_SENSORS_SCAN_Z, 1, IIO_MOD_Z, 's', IIO_LE, 12, 16,
+			ST_ACCEL_DEFAULT_OUT_Z_L_ADDR,
+			st_accel_mount_matrix_ext_info),
+	IIO_CHAN_SOFT_TIMESTAMP(3),
+	{
+		/* events/in_accel_x|y|z_change_en */
+		.type = IIO_ACCEL,
+		.modified = 1,
+		.channel2 = IIO_MOD_X_OR_Y_OR_Z,
+		.scan_index = -1,
+		.event_spec = &st_accel_orient_event,
+		.num_event_specs = 1,
+	},
 };
 
 static const struct iio_chan_spec st_accel_16bit_channels[] = {
@@ -1252,7 +1288,8 @@ static const struct st_sensor_settings st_accel_sensors_settings[] = {
 		.sensors_supported = {
 			[0] = SC7A20_ACCEL_DEV_NAME,
 		},
-		.ch = (struct iio_chan_spec *)st_accel_12bit_channels,
+		.ch = (struct iio_chan_spec *)st_accel_12bit_orient_channels,
+		.num_ch = ARRAY_SIZE(st_accel_12bit_orient_channels),
 		.odr = {
 			.addr = 0x20,
 			.mask = 0xf0,
@@ -1322,6 +1359,17 @@ static const struct st_sensor_settings st_accel_sensors_settings[] = {
 			.addr = 0x23,
 			.value = BIT(0),
 		},
+		.orient = {
+			.cfg_addr = 0x30,
+			.src_addr = 0x31,
+			.ths_addr = 0x32,
+			.dur_addr = 0x33,
+			.route_addr = 0x22,	/* I1_IA1 */
+			.route_mask = 0x40,
+			.latch_addr = 0x24,	/* LIR_INT1 */
+			.latch_mask = 0x08,
+			.ths_mg_lsb = 16,	/* at +-2 g */
+		},
 		.multi_read_bit = true,
 		.bootime = 2,
 	},
@@ -1366,7 +1414,12 @@ static int st_accel_write_raw(struct iio_dev *indio_dev,
 {
 	switch (mask) {
 	case IIO_CHAN_INFO_SCALE: {
+		struct st_sensor_data *adata = iio_priv(indio_dev);
 		int gain;
+
+		/* The orientation threshold is set for the current full scale */
+		if (adata->orient_enabled)
+			return -EBUSY;
 
 		gain = val * 1000000 + val2;
 		return st_sensors_set_fullscale_by_gain(indio_dev, gain);
@@ -1379,6 +1432,25 @@ static int st_accel_write_raw(struct iio_dev *indio_dev,
 	default:
 		return -EINVAL;
 	}
+}
+
+static int st_accel_read_event_config(struct iio_dev *indio_dev,
+				      const struct iio_chan_spec *chan,
+				      enum iio_event_type type,
+				      enum iio_event_direction dir)
+{
+	struct st_sensor_data *adata = iio_priv(indio_dev);
+
+	return adata->orient_enabled;
+}
+
+static int st_accel_write_event_config(struct iio_dev *indio_dev,
+				       const struct iio_chan_spec *chan,
+				       enum iio_event_type type,
+				       enum iio_event_direction dir,
+				       bool state)
+{
+	return st_sensors_set_orient_event(indio_dev, state);
 }
 
 static ST_SENSORS_DEV_ATTR_SAMP_FREQ_AVAIL();
@@ -1398,6 +1470,8 @@ static const struct iio_info accel_info = {
 	.attrs = &st_accel_attribute_group,
 	.read_raw = &st_accel_read_raw,
 	.write_raw = &st_accel_write_raw,
+	.read_event_config = &st_accel_read_event_config,
+	.write_event_config = &st_accel_write_event_config,
 	.debugfs_reg_access = &st_sensors_debugfs_reg_access,
 };
 
@@ -1578,7 +1652,8 @@ int st_accel_common_probe(struct iio_dev *indio_dev)
 
 	adata->num_data_channels = ST_ACCEL_NUMBER_DATA_CHANNELS;
 	indio_dev->channels = adata->sensor_settings->ch;
-	indio_dev->num_channels = ST_SENSORS_NUMBER_ALL_CHANNELS;
+	indio_dev->num_channels = adata->sensor_settings->num_ch ?:
+				  ST_SENSORS_NUMBER_ALL_CHANNELS;
 
 	/*
 	 * First try specific ACPI methods to retrieve orientation then try the

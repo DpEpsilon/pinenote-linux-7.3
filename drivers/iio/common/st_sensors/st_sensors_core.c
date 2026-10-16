@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/iio/iio.h>
+#include <linux/iio/events.h>
 #include <linux/irq.h>
 #include <linux/mutex.h>
 #include <linux/property.h>
@@ -191,6 +192,10 @@ int st_sensors_set_enable(struct iio_dev *indio_dev, bool enable)
 		if (found)
 			sdata->odr = odr_out.hz;
 	} else {
+		/* The orientation-change detector needs the sensor running */
+		if (sdata->orient_enabled)
+			return 0;
+
 		err = st_sensors_write_data_with_mask(indio_dev,
 				sdata->sensor_settings->pw.addr,
 				sdata->sensor_settings->pw.mask,
@@ -433,6 +438,8 @@ EXPORT_SYMBOL_NS(st_sensors_init_sensor, "IIO_ST_SENSORS");
  * st_sensors_allocate_trigger()), leaving the sensor powered down with
  * DRDY disabled. Safe to call when power was not lost.
  */
+static int st_sensors_program_orient(struct iio_dev *indio_dev, bool enable);
+
 int st_sensors_restore_config(struct iio_dev *indio_dev)
 {
 	struct st_sensor_data *sdata = iio_priv(indio_dev);
@@ -512,9 +519,171 @@ int st_sensors_restore_config(struct iio_dev *indio_dev)
 		}
 	}
 
-	return st_sensors_set_axis_enable(indio_dev, ST_SENSORS_ENABLE_ALL_AXIS);
+	err = st_sensors_set_axis_enable(indio_dev, ST_SENSORS_ENABLE_ALL_AXIS);
+	if (err < 0)
+		return err;
+
+	if (!sdata->orient_enabled)
+		return 0;
+
+	err = st_sensors_set_enable(indio_dev, true);
+	if (err < 0)
+		return err;
+
+	return st_sensors_program_orient(indio_dev, true);
 }
 EXPORT_SYMBOL_NS(st_sensors_restore_config, "IIO_ST_SENSORS");
+
+/*
+ * 6D orientation-change detection ("6D movement recognition", AOI=0 6D=1 in
+ * INT1_CFG): the sensor raises its interrupt when a different one of its six
+ * axis directions starts pointing down, i.e. passes the threshold for the
+ * duration, and stays quiet otherwise. That lets userspace offer a rotation
+ * without sampling the sensor all the time.
+ */
+#define ST_SENSORS_ORIENT_CFG		0x7f	/* 6D, all six directions */
+#define ST_SENSORS_ORIENT_SRC_IA	0x40	/* interrupt active */
+#define ST_SENSORS_ORIENT_THS_MG	700	/* about 45 degrees of tilt */
+#define ST_SENSORS_ORIENT_DUR_MS	300
+#define ST_SENSORS_ORIENT_MIN_ODR	10
+
+static int st_sensors_program_orient(struct iio_dev *indio_dev, bool enable)
+{
+	struct st_sensor_data *sdata = iio_priv(indio_dev);
+	const struct st_sensor_orient *o = &sdata->sensor_settings->orient;
+	unsigned int src;
+	int err;
+
+	if (!enable) {
+		err = regmap_write(sdata->regmap, o->cfg_addr, 0);
+		if (err < 0)
+			return err;
+		err = st_sensors_write_data_with_mask(indio_dev, o->route_addr,
+						      o->route_mask, 0);
+		if (err < 0)
+			return err;
+		return regmap_read(sdata->regmap, o->src_addr, &src);
+	}
+
+	err = regmap_write(sdata->regmap, o->ths_addr,
+			   DIV_ROUND_CLOSEST(ST_SENSORS_ORIENT_THS_MG,
+					     o->ths_mg_lsb));
+	if (err < 0)
+		return err;
+	err = regmap_write(sdata->regmap, o->dur_addr,
+			   max(1U, sdata->odr * ST_SENSORS_ORIENT_DUR_MS / 1000));
+	if (err < 0)
+		return err;
+	err = st_sensors_write_data_with_mask(indio_dev, o->latch_addr,
+					      o->latch_mask, 1);
+	if (err < 0)
+		return err;
+	/* Start from a cleared latch; the first event reports the current direction */
+	err = regmap_read(sdata->regmap, o->src_addr, &src);
+	if (err < 0)
+		return err;
+	err = regmap_write(sdata->regmap, o->cfg_addr, ST_SENSORS_ORIENT_CFG);
+	if (err < 0)
+		return err;
+	return st_sensors_write_data_with_mask(indio_dev, o->route_addr,
+					       o->route_mask, 1);
+}
+
+/**
+ * st_sensors_set_orient_event() - turn the 6D orientation-change event on or off
+ * @indio_dev: IIO device
+ * @enable: on or off
+ *
+ * While on, the sensor stays powered (at least ST_SENSORS_ORIENT_MIN_ODR) and
+ * its interrupt line also carries orientation changes, which the IRQ thread
+ * turns into IIO events. Needs the first (most sensitive) full scale, which
+ * the threshold is computed for.
+ */
+int st_sensors_set_orient_event(struct iio_dev *indio_dev, bool enable)
+{
+	struct st_sensor_data *sdata = iio_priv(indio_dev);
+	const struct st_sensor_settings *settings = sdata->sensor_settings;
+	int err;
+
+	if (!settings->orient.cfg_addr || sdata->irq <= 0)
+		return -EOPNOTSUPP;
+	if (enable == sdata->orient_enabled)
+		return 0;
+
+	if (enable) {
+		if (sdata->current_fullscale != &settings->fs.fs_avl[0])
+			return -EBUSY;
+		if (sdata->odr < ST_SENSORS_ORIENT_MIN_ODR) {
+			err = st_sensors_set_odr(indio_dev,
+						 ST_SENSORS_ORIENT_MIN_ODR);
+			if (err < 0)
+				return err;
+		}
+	}
+
+	mutex_lock(&sdata->odr_lock);
+	if (enable) {
+		err = st_sensors_set_enable(indio_dev, true);
+		if (err < 0)
+			goto unlock;
+		sdata->orient_enabled = true;
+		err = st_sensors_program_orient(indio_dev, true);
+		if (err < 0) {
+			sdata->orient_enabled = false;
+			st_sensors_program_orient(indio_dev, false);
+			if (!iio_buffer_enabled(indio_dev))
+				st_sensors_set_enable(indio_dev, false);
+		}
+	} else {
+		err = st_sensors_program_orient(indio_dev, false);
+		sdata->orient_enabled = false;
+		if (!iio_buffer_enabled(indio_dev))
+			st_sensors_set_enable(indio_dev, false);
+	}
+unlock:
+	mutex_unlock(&sdata->odr_lock);
+
+	return err;
+}
+EXPORT_SYMBOL_NS(st_sensors_set_orient_event, "IIO_ST_SENSORS");
+
+/**
+ * st_sensors_handle_orient_event() - push an orientation-change event if one is pending
+ * @indio_dev: IIO device
+ *
+ * Called from the IRQ thread; sleeps for one sample period after an event.
+ * Reading the source register clears the latch.
+ *
+ * Return: true if the interrupt was an orientation change.
+ */
+bool st_sensors_handle_orient_event(struct iio_dev *indio_dev)
+{
+	struct st_sensor_data *sdata = iio_priv(indio_dev);
+	unsigned int src;
+
+	if (!sdata->orient_enabled)
+		return false;
+	if (regmap_read(sdata->regmap, sdata->sensor_settings->orient.src_addr,
+			&src) < 0)
+		return false;
+	if (!(src & ST_SENSORS_ORIENT_SRC_IA))
+		return false;
+
+	iio_push_event(indio_dev,
+		       IIO_MOD_EVENT_CODE(IIO_ACCEL, 0, IIO_MOD_X_OR_Y_OR_Z,
+					  IIO_EV_TYPE_CHANGE, IIO_EV_DIR_NONE),
+		       sdata->hw_timestamp);
+
+	/*
+	 * Reading the source register clears the latch, but the sensor only
+	 * releases INT1 at its next sample. Returning now would unmask a
+	 * level IRQ that is still asserted and re-enter this thread (as
+	 * "unhandled") until then, so wait out one sample period.
+	 */
+	msleep(DIV_ROUND_UP(1000, sdata->odr) + 5);
+	return true;
+}
+EXPORT_SYMBOL_NS(st_sensors_handle_orient_event, "IIO_ST_SENSORS");
 
 int st_sensors_set_dataready_irq(struct iio_dev *indio_dev, bool enable)
 {

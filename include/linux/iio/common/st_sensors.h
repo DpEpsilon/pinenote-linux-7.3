@@ -185,6 +185,30 @@ struct st_sensor_data_ready_irq {
 };
 
 /**
+ * struct st_sensor_orient - 6D orientation-change detection on Interrupt Generator 1
+ * @cfg_addr: INT1_CFG, written with AOI=0 6D=1 and all six axis enables.
+ * @src_addr: INT1_SRC; reading it clears a latched interrupt.
+ * @ths_addr: INT1_THS, the threshold an axis must pass to count as "down".
+ * @dur_addr: INT1_DURATION, samples a new orientation must hold.
+ * @route_addr: register routing the generator to the INT1 pin.
+ * @route_mask: mask for @route_addr.
+ * @latch_addr: register latching the generator until @src_addr is read.
+ * @latch_mask: mask for @latch_addr.
+ * @ths_mg_lsb: threshold resolution in mg at the first full scale.
+ */
+struct st_sensor_orient {
+	u8 cfg_addr;
+	u8 src_addr;
+	u8 ths_addr;
+	u8 dur_addr;
+	u8 route_addr;
+	u8 route_mask;
+	u8 latch_addr;
+	u8 latch_mask;
+	u8 ths_mg_lsb;
+};
+
+/**
  * struct st_sensor_settings - ST specific sensor settings
  * @wai: Contents of WhoAmI register.
  * @wai_addr: The address of WhoAmI register.
@@ -199,6 +223,7 @@ struct st_sensor_data_ready_irq {
  * @das: Data Alignment Selection register.
  * @drdy_irq: Data ready register of the sensor.
  * @sim: SPI serial interface mode register of the sensor.
+ * @orient: 6D orientation-change interrupt, if supported (cfg_addr != 0).
  * @multi_read_bit: Use or not particular bit for [I2C/SPI] multi-read.
  * @bootime: samples to discard when sensor passing from power-down to power-up.
  */
@@ -216,6 +241,7 @@ struct st_sensor_settings {
 	struct st_sensor_das das;
 	struct st_sensor_data_ready_irq drdy_irq;
 	struct st_sensor_sim sim;
+	struct st_sensor_orient orient;
 	bool multi_read_bit;
 	unsigned int bootime;
 };
@@ -236,6 +262,7 @@ struct st_sensor_settings {
  * @edge_irq: the IRQ triggers on edges and need special handling.
  * @hw_irq_trigger: if we're using the hardware interrupt on the sensor.
  * @hw_timestamp: Latest timestamp from the interrupt handler, when in use.
+ * @orient_enabled: the 6D orientation-change event is on; the sensor stays powered.
  * @buffer_data: Data used by buffer part.
  * @odr_lock: Local lock for preventing concurrent ODR accesses/changes
  */
@@ -258,6 +285,8 @@ struct st_sensor_data {
 	bool edge_irq;
 	bool hw_irq_trigger;
 	s64 hw_timestamp;
+
+	bool orient_enabled;
 
 	struct mutex odr_lock;
 
@@ -289,6 +318,10 @@ int st_sensors_init_sensor(struct iio_dev *indio_dev,
 int st_sensors_set_enable(struct iio_dev *indio_dev, bool enable);
 
 int st_sensors_restore_config(struct iio_dev *indio_dev);
+
+int st_sensors_set_orient_event(struct iio_dev *indio_dev, bool enable);
+
+bool st_sensors_handle_orient_event(struct iio_dev *indio_dev);
 
 int st_sensors_set_axis_enable(struct iio_dev *indio_dev, u8 axis_enable);
 
