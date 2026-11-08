@@ -1726,6 +1726,15 @@ config REGULATOR_TPS65185
 	  so it is found in E-Book readers.
 	  If HWWON is enabled, it also provides temperature measurement.
 
+config REGULATOR_TPS65185_HRDL
+	tristate "TI TPS65185 PMIC for E-Paper Display (hrdl/PineNote driver)"
+	depends on !REGULATOR_TPS65185
+	depends on GPIOLIB && I2C && IIO
+	select IIO_TRIGGERED_EVENT
+	select REGMAP_I2C
+	help
+	  This driver supports the voltage regulators on the TPS65185 PMIC
+	  specifically designed for e-paper display panels.
 
 config REGULATOR_TPS65217
 	tristate "TI TPS65217 Power regulators"
