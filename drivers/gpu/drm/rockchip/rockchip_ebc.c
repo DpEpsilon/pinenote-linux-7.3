@@ -1583,7 +1583,7 @@ static void rockchip_ebc_crtc_mode_set_nofb(struct drm_crtc *crtc)
 }
 
 static int rockchip_ebc_crtc_atomic_check(struct drm_crtc *crtc,
-					  struct drm_atomic_state *state)
+					  struct drm_atomic_commit *state)
 {
 	struct rockchip_ebc *ebc = crtc_to_ebc(crtc);
 	struct ebc_crtc_state *ebc_crtc_state;
@@ -1619,7 +1619,7 @@ static int rockchip_ebc_crtc_atomic_check(struct drm_crtc *crtc,
 }
 
 static void rockchip_ebc_crtc_atomic_flush(struct drm_crtc *crtc,
-					   struct drm_atomic_state *state)
+					   struct drm_atomic_commit *state)
 {
 	// TODO: consider moving copying to final_buffer, moving of areas, setting switch_required, waking up process here
 	// TODO: also look at atomic_commit
@@ -1627,7 +1627,7 @@ static void rockchip_ebc_crtc_atomic_flush(struct drm_crtc *crtc,
 }
 
 static void rockchip_ebc_crtc_atomic_enable(struct drm_crtc *crtc,
-					    struct drm_atomic_state *state)
+					    struct drm_atomic_commit *state)
 {
 	struct rockchip_ebc *ebc = crtc_to_ebc(crtc);
 	struct drm_crtc_state *crtc_state;
@@ -1641,7 +1641,7 @@ static void rockchip_ebc_crtc_atomic_enable(struct drm_crtc *crtc,
 }
 
 static void rockchip_ebc_crtc_atomic_disable(struct drm_crtc *crtc,
-					     struct drm_atomic_state *state)
+					     struct drm_atomic_commit *state)
 {
 	struct rockchip_ebc *ebc = crtc_to_ebc(crtc);
 	struct drm_crtc_state *crtc_state;
@@ -1749,7 +1749,7 @@ static inline struct rockchip_ebc *plane_to_ebc(struct drm_plane *plane)
 }
 
 static int rockchip_ebc_plane_atomic_check(struct drm_plane *plane,
-					   struct drm_atomic_state *state)
+					   struct drm_atomic_commit *state)
 {
 	struct drm_atomic_helper_damage_iter iter;
 	struct ebc_plane_state *ebc_plane_state;
@@ -1782,7 +1782,7 @@ static int rockchip_ebc_plane_atomic_check(struct drm_plane *plane,
 }
 
 static void rockchip_ebc_plane_atomic_update(struct drm_plane *plane,
-					     struct drm_atomic_state *state)
+					     struct drm_atomic_commit *state)
 {
 	struct rockchip_ebc *ebc = plane_to_ebc(plane);
 	struct ebc_plane_state *ebc_plane_state;

@@ -12,7 +12,8 @@
 #include <linux/bitops.h>
 #include <linux/cpu.h>
 #include <linux/module.h>
-#include <linux/of_gpio.h>
+#include <linux/of.h>
+#include <linux/string.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/regulator/driver.h>
@@ -80,23 +81,23 @@ static int parse_on_off_regulator(struct device_node *node, enum rk_pm_state sta
 
 	switch (state) {
 	case RK_PM_MEM:
-		strncpy(on_prop_name, "rockchip,regulator-on-in-mem",
+		strscpy(on_prop_name, "rockchip,regulator-on-in-mem",
 			MAX_ON_OFF_REG_PROP_NAME_LEN);
-		strncpy(off_prop_name, "rockchip,regulator-off-in-mem",
+		strscpy(off_prop_name, "rockchip,regulator-off-in-mem",
 			MAX_ON_OFF_REG_PROP_NAME_LEN);
 	break;
 
 	case RK_PM_MEM_LITE:
-		strncpy(on_prop_name, "rockchip,regulator-on-in-mem-lite",
+		strscpy(on_prop_name, "rockchip,regulator-on-in-mem-lite",
 			MAX_ON_OFF_REG_PROP_NAME_LEN);
-		strncpy(off_prop_name, "rockchip,regulator-off-in-mem-lite",
+		strscpy(off_prop_name, "rockchip,regulator-off-in-mem-lite",
 			MAX_ON_OFF_REG_PROP_NAME_LEN);
 	break;
 
 	case RK_PM_MEM_ULTRA:
-		strncpy(on_prop_name, "rockchip,regulator-on-in-mem-ultra",
+		strscpy(on_prop_name, "rockchip,regulator-on-in-mem-ultra",
 			MAX_ON_OFF_REG_PROP_NAME_LEN);
-		strncpy(off_prop_name, "rockchip,regulator-off-in-mem-ultra",
+		strscpy(off_prop_name, "rockchip,regulator-off-in-mem-ultra",
 			MAX_ON_OFF_REG_PROP_NAME_LEN);
 	break;
 
