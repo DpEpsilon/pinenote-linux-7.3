@@ -2525,3 +2525,4 @@ module_platform_driver(rockchip_ebc_driver);
 MODULE_AUTHOR("Samuel Holland <samuel@sholland.org>, Maximilian Weigand, hrdl <git@hrdl.eu>");
 MODULE_DESCRIPTION("Rockchip EBC driver");
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS("IIO_CONSUMER");
